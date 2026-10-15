@@ -273,9 +273,12 @@ struct DecodeArgs {
 #[tool_router]
 impl GtfsServer {
     #[tool(
-        description = "Register a GTFS source. Pass feed_set, or static_url/static_path plus optional realtime URLs. Replaces an existing feed with the same feed_id. Returns feed health. Header values are stored and not echoed."
+        description = "Register a GTFS source at runtime. Pass feed_set, or static_url/static_path plus optional realtime URLs. Replaces an existing feed with the same feed_id, including one that failed to load from the environment. Returns feed health. Header values are stored and not echoed."
     )]
-    async fn register_feed(&self, Parameters(args): Parameters<RegisterArgs>) -> Result<String, String> {
+    async fn register_feed(
+        &self,
+        Parameters(args): Parameters<RegisterArgs>,
+    ) -> Result<String, String> {
         let request = RegisterRequest {
             feed_id: args.feed_id,
             feed_set: args.feed_set,
@@ -294,7 +297,9 @@ impl GtfsServer {
         finish(self.catalog.register(request).await)
     }
 
-    #[tool(description = "List registered feeds and their freshness. Header values are omitted.")]
+    #[tool(
+        description = "List feeds registered at startup from GTFS_RT_MCP_* environment variables and feeds added with register_feed. A feed that failed to load has ready:false and an error. config_errors lists startup configuration problems. Header values are omitted."
+    )]
     async fn list_feeds(&self) -> Result<String, String> {
         Ok(compact(&self.catalog.list()))
     }
@@ -310,21 +315,30 @@ impl GtfsServer {
     #[tool(
         description = "Fetch the feed again. A feed-set reloads static.zip only when generation_id or static_version changes. Direct realtime URLs are always refetched."
     )]
-    async fn refresh_feed(&self, Parameters(args): Parameters<FeedIdArgs>) -> Result<String, String> {
+    async fn refresh_feed(
+        &self,
+        Parameters(args): Parameters<FeedIdArgs>,
+    ) -> Result<String, String> {
         finish(self.catalog.refresh(args.feed_id).await)
     }
 
     #[tool(
-        description = "Feed health: entity counts, header timestamps, age, TTL, last error, and the current feed-set generation. Refreshes first when the realtime TTL has elapsed."
+        description = "Feed health: entity counts, header timestamps, age, TTL, last error, and the current feed-set generation. Refreshes a loaded feed first when the realtime TTL has elapsed. A feed that failed at startup returns ready:false and does not retry until refresh_feed. When startup configuration is invalid, config_errors is included."
     )]
-    async fn feed_health(&self, Parameters(args): Parameters<FeedIdArgs>) -> Result<String, String> {
+    async fn feed_health(
+        &self,
+        Parameters(args): Parameters<FeedIdArgs>,
+    ) -> Result<String, String> {
         finish(self.catalog.health(args.feed_id).await)
     }
 
     #[tool(
         description = "Search stops by stop_id, stop_code, or name. Ranked exact ids and codes first. Returns stop_id, name, coordinates, location_type, parent_station, and platform_code."
     )]
-    async fn search_stops(&self, Parameters(args): Parameters<SearchArgs>) -> Result<String, String> {
+    async fn search_stops(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<String, String> {
         finish(
             self.catalog
                 .search_stops(
@@ -340,7 +354,10 @@ impl GtfsServer {
     #[tool(
         description = "Search routes by route_id, short name, or long name. Returns route_type and route_type_name."
     )]
-    async fn search_routes(&self, Parameters(args): Parameters<SearchArgs>) -> Result<String, String> {
+    async fn search_routes(
+        &self,
+        Parameters(args): Parameters<SearchArgs>,
+    ) -> Result<String, String> {
         finish(
             self.catalog
                 .search_routes(
@@ -527,7 +544,7 @@ impl GtfsServer {
 #[tool_handler(
     router = self.tool_router,
     name = "gtfs-rt-mcp",
-    instructions = "Explore GTFS static schedules and GTFS-Realtime for any agency. register_feed accepts a feed-set URL (a /v1/feed-set.json document whose urls point at an immutable generation: static.zip, trip-updates.pb, vehicle-positions.pb, alerts.pb) or a static GTFS zip plus realtime protobuf URLs. Then answer with trip_status (trip id or trip_short_name / train number), departure_board, trip_schedule, vehicle_positions, trip_updates, and alerts. Delays are seconds and positive means late. Track or platform assignments are assigned_stop_id and platform_code. Pass at_unix to pin the clock. Responses are compact JSON. Page with offset until next_offset is null. feed_health reports freshness. decode_protobuf turns a GTFS-Realtime message into JSON without registering a feed. HTTP header values given at registration are kept for fetches and are never echoed back."
+    instructions = "Explore GTFS static schedules and GTFS-Realtime for any agency. Feeds configured with GTFS_RT_MCP_FEED_SET, GTFS_RT_MCP_STATIC, GTFS_RT_MCP_FEED_<n>_*, or GTFS_RT_MCP_FEEDS are already registered at startup; call list_feeds before register_feed. config_errors on list_feeds and feed_health describes invalid startup configuration, and a row with ready:false failed to load. register_feed still accepts a feed-set URL (a /v1/feed-set.json document whose urls point at an immutable generation: static.zip, trip-updates.pb, vehicle-positions.pb, alerts.pb) or a static GTFS zip plus realtime protobuf URLs. Answer with trip_status (trip id or trip_short_name / train number), departure_board, trip_schedule, vehicle_positions, trip_updates, and alerts. Delays are seconds and positive means late. Track or platform assignments are assigned_stop_id and platform_code. Pass at_unix to pin the clock. Responses are compact JSON. Page with offset until next_offset is null. feed_health reports freshness. decode_protobuf turns a GTFS-Realtime message into JSON without registering a feed. HTTP header values are kept for fetches and are never echoed back."
 )]
 impl ServerHandler for GtfsServer {}
 
@@ -600,10 +617,7 @@ fn http_router(catalog: Arc<Catalog>, allowed_hosts: Vec<String>) -> axum::Route
         config,
     );
     axum::Router::new()
-        .route(
-            "/healthz",
-            axum::routing::get(|| async { "ok" }),
-        )
+        .route("/healthz", axum::routing::get(|| async { "ok" }))
         .nest_service("/mcp", service)
 }
 

@@ -11,7 +11,10 @@ use crate::error::{err, AppError};
 use crate::fixtures;
 use crate::gtfs::StaticDb;
 use crate::gtfs_rt::FeedMessage;
-use crate::query::{self, AlertQuery, BoardQuery, RtView, ScheduleQuery, TripStatusQuery, TripUpdateQuery, VehicleQuery};
+use crate::query::{
+    self, AlertQuery, BoardQuery, RtView, ScheduleQuery, TripStatusQuery, TripUpdateQuery,
+    VehicleQuery,
+};
 use crate::realtime::{self, incrementality};
 use crate::source::{
     self, fetch_bytes, loc_label, manifest_json, parse_feed_set, validate_headers, FeedSpec, Loc,
@@ -67,9 +70,17 @@ struct Slot {
     data: Mutex<FeedData>,
 }
 
+struct FailedFeed {
+    request: RegisterRequest,
+    error: String,
+    hint: Option<String>,
+}
+
 pub struct Catalog {
     http: reqwest::Client,
     feeds: Mutex<HashMap<String, std::sync::Arc<Slot>>>,
+    failed: Mutex<HashMap<String, FailedFeed>>,
+    config_errors: Mutex<Vec<Value>>,
 }
 
 impl Catalog {
@@ -77,7 +88,44 @@ impl Catalog {
         Ok(Self {
             http: source::http_client()?,
             feeds: Mutex::new(HashMap::new()),
+            failed: Mutex::new(HashMap::new()),
+            config_errors: Mutex::new(Vec::new()),
         })
+    }
+
+    pub fn add_config_errors(&self, errors: Vec<Value>) {
+        if errors.is_empty() {
+            return;
+        }
+        lock(&self.config_errors).extend(errors);
+    }
+
+    pub fn note_load_failure(&self, mut request: RegisterRequest, error: &AppError) {
+        let Some(id) = request.feed_id.clone().filter(|id| !id.is_empty()) else {
+            self.add_config_errors(vec![json!({
+                "error": error.error,
+                "hint": error.hint,
+            })]);
+            return;
+        };
+        if lock(&self.feeds).contains_key(&id) {
+            return;
+        }
+        let mut message = error.error.clone();
+        for value in request.headers.values() {
+            if value.len() >= 4 {
+                message = message.replace(value, "[redacted]");
+            }
+        }
+        request.feed_id = Some(id.clone());
+        lock(&self.failed).insert(
+            id,
+            FailedFeed {
+                request,
+                error: message,
+                hint: error.hint.clone(),
+            },
+        );
     }
 
     pub async fn register(&self, request: RegisterRequest) -> Result<Value, AppError> {
@@ -85,7 +133,12 @@ impl Catalog {
         let id = normalize_id(request.feed_id.as_deref())?;
         let spec = spec_from_request(&request)?;
         let rt_ttl = Duration::from_secs(request.rt_ttl_secs.unwrap_or(15).clamp(1, 3600));
-        let static_ttl = Duration::from_secs(request.static_ttl_secs.unwrap_or(6 * 3600).min(7 * 24 * 3600));
+        let static_ttl = Duration::from_secs(
+            request
+                .static_ttl_secs
+                .unwrap_or(6 * 3600)
+                .min(7 * 24 * 3600),
+        );
         let data = load_feed(
             &self.http,
             id.clone(),
@@ -97,19 +150,23 @@ impl Catalog {
         .await?;
         let summary = health_json(&data, now_unix());
         {
+            let replacing_failure = lock(&self.failed).contains_key(&id);
+            let failed_count = lock(&self.failed).len();
             let mut feeds = lock(&self.feeds);
-            if !feeds.contains_key(&id) && feeds.len() >= MAX_FEEDS {
+            let occupied = feeds.len() + failed_count - usize::from(replacing_failure);
+            if !feeds.contains_key(&id) && occupied >= MAX_FEEDS {
                 return Err(err(format!("at most {MAX_FEEDS} feeds can be registered")));
             }
             feeds.insert(
-                id,
+                id.clone(),
                 std::sync::Arc::new(Slot {
                     refresh: tokio::sync::Mutex::new(()),
                     data: Mutex::new(data),
                 }),
             );
         }
-        Ok(summary)
+        lock(&self.failed).remove(&id);
+        Ok(self.decorate(summary))
     }
 
     pub fn list(&self) -> Value {
@@ -118,19 +175,30 @@ impl Catalog {
             .values()
             .map(|slot| health_json(&lock(&slot.data), now_unix()))
             .collect();
+        drop(feeds);
+        for (id, failure) in lock(&self.failed).iter() {
+            if rows
+                .iter()
+                .any(|row| row.get("feed_id").and_then(|v| v.as_str()) == Some(id))
+            {
+                continue;
+            }
+            rows.push(failure_json(failure));
+        }
         rows.sort_by(|a, b| {
             a.get("feed_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .cmp(b.get("feed_id").and_then(|v| v.as_str()).unwrap_or(""))
         });
-        json!({ "feeds": rows })
+        self.decorate(json!({ "feeds": rows }))
     }
 
     pub fn unregister(&self, feed_id: Option<String>) -> Result<Value, AppError> {
         let id = self.resolve_id(feed_id.as_deref())?;
-        let mut feeds = lock(&self.feeds);
-        if feeds.remove(&id).is_none() {
+        let removed_live = lock(&self.feeds).remove(&id).is_some();
+        let removed_failed = lock(&self.failed).remove(&id).is_some();
+        if !removed_live && !removed_failed {
             return Err(err(format!("no feed named '{id}'")));
         }
         Ok(json!({ "removed": id }))
@@ -138,12 +206,34 @@ impl Catalog {
 
     pub async fn refresh(&self, feed_id: Option<String>) -> Result<Value, AppError> {
         let id = self.resolve_id(feed_id.as_deref())?;
+        let failure = lock(&self.failed).remove(&id);
+        if let Some(failure) = failure {
+            return match self.register(failure.request.clone()).await {
+                Ok(value) => Ok(value),
+                Err(error) => {
+                    self.note_load_failure(failure.request, &error);
+                    Err(error)
+                }
+            };
+        }
         self.ensure(&id, true).await?;
         self.health_cached(&id)
     }
 
     pub async fn health(&self, feed_id: Option<String>) -> Result<Value, AppError> {
-        let id = self.resolve_id(feed_id.as_deref())?;
+        let id = match self.resolve_id(feed_id.as_deref()) {
+            Ok(id) => id,
+            Err(error)
+                if feed_id.as_deref().unwrap_or("").trim().is_empty()
+                    && error.error == "feed configuration is invalid" =>
+            {
+                return Ok(error.to_json());
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(value) = self.failure_document(&id) {
+            return Ok(value);
+        }
         self.ensure(&id, false).await?;
         self.health_cached(&id)
     }
@@ -155,7 +245,7 @@ impl Catalog {
         limit: usize,
         offset: usize,
     ) -> Result<Value, AppError> {
-        let id = self.resolve_id(feed_id.as_deref())?;
+        let id = self.require_loaded(feed_id.as_deref())?;
         self.ensure(&id, false).await?;
         let slot = self.slot(&id)?;
         let data = lock(&slot.data);
@@ -170,8 +260,14 @@ impl Catalog {
                     ("lat", realtime::json_f64(stop.lat)),
                     ("lon", realtime::json_f64(stop.lon)),
                     ("location_type", json!(stop.location_type)),
-                    ("parent_station", realtime::json_opt(stop.parent_station.clone())),
-                    ("platform_code", realtime::json_opt(stop.platform_code.clone())),
+                    (
+                        "parent_station",
+                        realtime::json_opt(stop.parent_station.clone()),
+                    ),
+                    (
+                        "platform_code",
+                        realtime::json_opt(stop.platform_code.clone()),
+                    ),
                 ])
             })
             .collect();
@@ -185,7 +281,7 @@ impl Catalog {
         limit: usize,
         offset: usize,
     ) -> Result<Value, AppError> {
-        let id = self.resolve_id(feed_id.as_deref())?;
+        let id = self.require_loaded(feed_id.as_deref())?;
         self.ensure(&id, false).await?;
         let slot = self.slot(&id)?;
         let data = lock(&slot.data);
@@ -195,8 +291,14 @@ impl Catalog {
             .map(|route| {
                 realtime::obj([
                     ("route_id", json!(route.route_id)),
-                    ("route_short_name", realtime::json_opt(route.short_name.clone())),
-                    ("route_long_name", realtime::json_opt(route.long_name.clone())),
+                    (
+                        "route_short_name",
+                        realtime::json_opt(route.short_name.clone()),
+                    ),
+                    (
+                        "route_long_name",
+                        realtime::json_opt(route.long_name.clone()),
+                    ),
                     ("route_type", json!(route.route_type)),
                     (
                         "route_type_name",
@@ -325,7 +427,9 @@ impl Catalog {
     ) -> Result<Value, AppError> {
         validate_headers(&headers)?;
         let sources = [
-            path.as_ref().filter(|s| !s.trim().is_empty()).map(|_| "path"),
+            path.as_ref()
+                .filter(|s| !s.trim().is_empty())
+                .map(|_| "path"),
             url.as_ref().filter(|s| !s.trim().is_empty()).map(|_| "url"),
             base64_body
                 .as_ref()
@@ -371,7 +475,7 @@ impl Catalog {
     where
         F: FnOnce(&StaticDb, RtView<'_>) -> Result<Value, AppError>,
     {
-        let id = self.resolve_id(feed_id.as_deref())?;
+        let id = self.require_loaded(feed_id.as_deref())?;
         self.ensure(&id, false).await?;
         let slot = self.slot(&id)?;
         let data = lock(&slot.data);
@@ -388,28 +492,94 @@ impl Catalog {
     }
 
     fn health_cached(&self, id: &str) -> Result<Value, AppError> {
-        let slot = self.slot(id)?;
-        let data = lock(&slot.data);
-        Ok(health_json(&data, now_unix()))
+        let value = {
+            let slot = self.slot(id)?;
+            let data = lock(&slot.data);
+            health_json(&data, now_unix())
+        };
+        Ok(self.decorate(value))
     }
 
     fn resolve_id(&self, requested: Option<&str>) -> Result<String, AppError> {
         let feeds = lock(&self.feeds);
+        let failed = lock(&self.failed);
+        let mut known: Vec<String> = feeds
+            .keys()
+            .cloned()
+            .chain(failed.keys().cloned())
+            .collect();
+        known.sort();
+        known.dedup();
         if let Some(id) = requested.map(str::trim).filter(|id| !id.is_empty()) {
-            if feeds.contains_key(id) {
+            if known.iter().any(|known| known == id) {
                 return Ok(id.to_string());
             }
-            let known: Vec<_> = feeds.keys().cloned().collect();
-            return Err(err(format!("no feed named '{id}'")).extra("feeds", json!(known)));
+            return Err(self.with_config_errors(
+                err(format!("no feed named '{id}'")).extra("feeds", json!(known)),
+            ));
         }
-        match feeds.len() {
-            0 => Err(err("no feed registered").hint("call register_feed first")),
-            1 => Ok(feeds.keys().next().unwrap().clone()),
-            _ => {
-                let known: Vec<_> = feeds.keys().cloned().collect();
-                Err(err("multiple feeds are registered; pass feed_id").extra("feeds", json!(known)))
+        match known.len() {
+            0 => {
+                let errors = lock(&self.config_errors).clone();
+                drop(failed);
+                drop(feeds);
+                if errors.is_empty() {
+                    Err(err("no feed registered").hint(
+                        "set GTFS_RT_MCP_FEED_SET or GTFS_RT_MCP_STATIC in the MCP client env, or call register_feed",
+                    ))
+                } else {
+                    Err(err("feed configuration is invalid")
+                        .hint("see config_errors")
+                        .extra("config_errors", json!(errors)))
+                }
             }
+            1 => Ok(known.pop().unwrap()),
+            _ => Err(self.with_config_errors(
+                err("multiple feeds are registered; pass feed_id").extra("feeds", json!(known)),
+            )),
         }
+    }
+
+    fn require_loaded(&self, requested: Option<&str>) -> Result<String, AppError> {
+        let id = self.resolve_id(requested)?;
+        if let Some(message) = self.failure_message(&id) {
+            return Err(err(message).hint(
+                "this feed did not load from its startup configuration; fix it and call refresh_feed",
+            ));
+        }
+        Ok(id)
+    }
+
+    fn with_config_errors(&self, error: AppError) -> AppError {
+        let errors = lock(&self.config_errors).clone();
+        if errors.is_empty() {
+            error
+        } else {
+            error.extra("config_errors", json!(errors))
+        }
+    }
+
+    fn failure_message(&self, id: &str) -> Option<String> {
+        lock(&self.failed)
+            .get(id)
+            .map(|failure| failure.error.clone())
+    }
+
+    fn failure_document(&self, id: &str) -> Option<Value> {
+        lock(&self.failed)
+            .get(id)
+            .map(|failure| self.decorate(failure_json(failure)))
+    }
+
+    fn decorate(&self, mut value: Value) -> Value {
+        let errors = lock(&self.config_errors).clone();
+        if errors.is_empty() {
+            return value;
+        }
+        if let Some(object) = value.as_object_mut() {
+            object.insert("config_errors".into(), json!(errors));
+        }
+        value
     }
 
     fn slot(&self, id: &str) -> Result<std::sync::Arc<Slot>, AppError> {
@@ -524,12 +694,17 @@ fn static_key_for(manifest: &Manifest) -> String {
 
 fn same_generation(plan: &RefreshPlan, manifest: &Manifest) -> bool {
     match (&plan.generation, &manifest.generation_id) {
-        (Some(previous), Some(next)) => previous == next && plan.static_key == static_key_for(manifest),
+        (Some(previous), Some(next)) => {
+            previous == next && plan.static_key == static_key_for(manifest)
+        }
         _ => false,
     }
 }
 
-async fn refresh_loaded(http: &reqwest::Client, plan: &RefreshPlan) -> Result<FeedUpdate, AppError> {
+async fn refresh_loaded(
+    http: &reqwest::Client,
+    plan: &RefreshPlan,
+) -> Result<FeedUpdate, AppError> {
     match &plan.spec {
         FeedSpec::FeedSet { url } => {
             let bytes = fetch_bytes(http, url, &plan.headers, 2_000_000).await?;
@@ -771,6 +946,7 @@ fn health_json(data: &FeedData, now: i64) -> Value {
         .unwrap_or(u64::MAX);
     json!({
         "feed_id": data.id,
+        "ready": true,
         "source": source,
         "headers": data.headers.keys().cloned().collect::<Vec<_>>(),
         "static": {
@@ -801,6 +977,35 @@ fn health_json(data: &FeedData, now: i64) -> Value {
     })
 }
 
+fn failure_json(failure: &FailedFeed) -> Value {
+    let request = &failure.request;
+    let source = if let Some(feed_set) = &request.feed_set {
+        json!({ "kind": "feed_set", "url": feed_set })
+    } else {
+        json!({
+            "kind": "direct",
+            "static": request.static_url.clone().or(request.static_path.clone()),
+            "trip_updates": request.trip_updates_url.clone().or(request.trip_updates_path.clone()),
+            "vehicle_positions": request
+                .vehicle_positions_url
+                .clone()
+                .or(request.vehicle_positions_path.clone()),
+            "alerts": request.alerts_url.clone().or(request.alerts_path.clone()),
+        })
+    };
+    realtime::obj([
+        ("feed_id", json!(failure.request.feed_id)),
+        ("ready", json!(false)),
+        ("error", json!(failure.error)),
+        ("hint", realtime::json_opt(failure.hint.clone())),
+        (
+            "headers",
+            json!(request.headers.keys().cloned().collect::<Vec<_>>()),
+        ),
+        ("source", source),
+    ])
+}
+
 fn feed_health(feed: Option<&CachedFeed>, now: i64) -> Value {
     let Some(feed) = feed else {
         return Value::Null;
@@ -811,7 +1016,10 @@ fn feed_health(feed: Option<&CachedFeed>, now: i64) -> Value {
         ("entities", json!(feed.message.entity.len())),
         ("bytes", json!(feed.bytes)),
         ("source", json!(feed.source)),
-        ("header_timestamp", realtime::json_i64(timestamp.map(|v| v as i64))),
+        (
+            "header_timestamp",
+            realtime::json_i64(timestamp.map(|v| v as i64)),
+        ),
         ("header_age_sec", realtime::json_i64(header_age)),
         (
             "incrementality",
@@ -867,7 +1075,11 @@ fn spec_from_request(request: &RegisterRequest) -> Result<FeedSpec, AppError> {
         request.vehicle_positions_path.clone(),
         "vehicle positions",
     )?;
-    let alerts = one_loc(request.alerts_url.clone(), request.alerts_path.clone(), "alerts")?;
+    let alerts = one_loc(
+        request.alerts_url.clone(),
+        request.alerts_path.clone(),
+        "alerts",
+    )?;
     Ok(FeedSpec::Direct {
         static_gtfs,
         trip_updates,
@@ -876,7 +1088,11 @@ fn spec_from_request(request: &RegisterRequest) -> Result<FeedSpec, AppError> {
     })
 }
 
-fn one_loc(url: Option<String>, path: Option<String>, label: &str) -> Result<Option<Loc>, AppError> {
+fn one_loc(
+    url: Option<String>,
+    path: Option<String>,
+    label: &str,
+) -> Result<Option<Loc>, AppError> {
     match (nonempty(url), nonempty(path)) {
         (Some(_), Some(_)) => Err(err(format!("{label}: pass a url or a path, not both"))),
         (Some(url), None) => Ok(Some(parse_user_loc(&url)?)),
@@ -891,7 +1107,8 @@ fn parse_user_loc(value: &str) -> Result<Loc, AppError> {
     } else if let Some(rest) = value.strip_prefix("file://") {
         Ok(Loc::File(PathBuf::from(percent_decode(rest))))
     } else if value.contains("://") {
-        Err(err(format!("unsupported scheme in '{value}'")).hint("use http(s) or a filesystem path"))
+        Err(err(format!("unsupported scheme in '{value}'"))
+            .hint("use http(s) or a filesystem path"))
     } else {
         Ok(Loc::File(PathBuf::from(value)))
     }
@@ -903,7 +1120,10 @@ fn percent_decode(value: &str) -> String {
     let mut index = 0;
     while index < bytes.len() {
         if bytes[index] == b'%' && index + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""), 16) {
+            if let Ok(byte) = u8::from_str_radix(
+                std::str::from_utf8(&bytes[index + 1..index + 3]).unwrap_or(""),
+                16,
+            ) {
                 out.push(byte);
                 index += 3;
                 continue;
@@ -926,8 +1146,32 @@ fn nonempty(value: Option<String>) -> Option<String> {
     })
 }
 
+pub(crate) fn validate_startup_request(request: &RegisterRequest) -> Result<String, AppError> {
+    validate_headers(&request.headers)?;
+    let id = normalize_id(request.feed_id.as_deref())?;
+    spec_from_request(request)?;
+    if let Some(ttl) = request.rt_ttl_secs {
+        if !(1..=3600).contains(&ttl) {
+            return Err(err(format!(
+                "realtime TTL must be 1-3600 seconds, got {ttl}"
+            )));
+        }
+    }
+    if let Some(ttl) = request.static_ttl_secs {
+        if ttl > 7 * 24 * 3600 {
+            return Err(err(format!(
+                "static TTL must be 0-604800 seconds, got {ttl}"
+            )));
+        }
+    }
+    Ok(id)
+}
+
 fn normalize_id(id: Option<&str>) -> Result<String, AppError> {
-    let id = id.map(str::trim).filter(|id| !id.is_empty()).unwrap_or("default");
+    let id = id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("default");
     if id.len() > 64
         || !id
             .chars()
@@ -992,13 +1236,7 @@ mod tests {
             .unwrap();
 
         let status = catalog
-            .trip_status(
-                None,
-                "177",
-                Some("NHV".into()),
-                Some(paths.at_unix),
-                6,
-            )
+            .trip_status(None, "177", Some("NHV".into()), Some(paths.at_unix), 6)
             .await
             .unwrap();
         let trip = &status["trips"][0];
@@ -1015,17 +1253,7 @@ mod tests {
         assert!(trip["delay_label"].as_str().unwrap().contains("late"));
 
         let board = catalog
-            .departure_board(
-                None,
-                "NHV",
-                None,
-                Some(paths.at_unix),
-                120,
-                5,
-                20,
-                0,
-                false,
-            )
+            .departure_board(None, "NHV", None, Some(paths.at_unix), 120, 5, 20, 0, false)
             .await
             .unwrap();
         let short_names: Vec<_> = board["departures"]
@@ -1070,7 +1298,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(alerts["returned"], 1);
-        assert_eq!(alerts["alerts"][0]["header"], "Track work between NYP and NHV");
+        assert_eq!(
+            alerts["alerts"][0]["header"],
+            "Track work between NYP and NHV"
+        );
         assert_eq!(alerts["alerts"][0]["effect"], "SIGNIFICANT_DELAYS");
         assert_eq!(
             alerts["alerts"][0]["informed_entity"][0]["route_short_name"],
@@ -1161,14 +1392,8 @@ mod tests {
                         async move {
                             let path = root.join(&name);
                             match tokio::fs::read(path).await {
-                                Ok(bytes) => (
-                                    axum::http::StatusCode::OK,
-                                    bytes,
-                                ),
-                                Err(_) => (
-                                    axum::http::StatusCode::NOT_FOUND,
-                                    Vec::new(),
-                                ),
+                                Ok(bytes) => (axum::http::StatusCode::OK, bytes),
+                                Err(_) => (axum::http::StatusCode::NOT_FOUND, Vec::new()),
                             }
                         }
                     }
@@ -1270,6 +1495,71 @@ mod tests {
         let health = catalog.health(None).await.unwrap();
         assert_eq!(health["feed_set"]["generation_id"], "gen-2");
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn failed_startup_feed_is_visible_and_register_clears_it() {
+        let secret = "header-secret-value";
+        let catalog = Catalog::new().unwrap();
+        catalog.add_config_errors(vec![json!({
+            "error": "numbered feeds skip 2",
+            "var": "GTFS_RT_MCP_FEED_2_STATIC"
+        })]);
+        let mut headers = BTreeMap::new();
+        headers.insert("x-api-key".into(), secret.into());
+        catalog.note_load_failure(
+            RegisterRequest {
+                feed_id: Some("amtrak".into()),
+                static_path: Some("/no/such/gtfs-rt-mcp-static.zip".into()),
+                headers,
+                ..Default::default()
+            },
+            &err(format!("connect failed token {secret}")),
+        );
+
+        let listed = catalog.list().to_string();
+        assert!(listed.contains("amtrak"), "{listed}");
+        assert!(listed.contains("\"ready\":false"), "{listed}");
+        assert!(listed.contains("config_errors"), "{listed}");
+        assert!(listed.contains("[redacted]"), "{listed}");
+        assert!(!listed.contains(secret), "{listed}");
+
+        let health = catalog.health(Some("amtrak".into())).await.unwrap();
+        let health_text = health.to_string();
+        assert_eq!(health["ready"], false);
+        assert_eq!(health["headers"][0], "x-api-key");
+        assert!(health_text.contains("config_errors"), "{health_text}");
+        assert!(!health_text.contains(secret), "{health_text}");
+
+        let query_error = catalog
+            .trip_status(Some("amtrak".into()), "177", None, None, 6)
+            .await
+            .unwrap_err();
+        assert!(
+            query_error.error.contains("[redacted]"),
+            "{}",
+            query_error.error
+        );
+        assert!(!query_error.error.contains(secret), "{}", query_error.error);
+
+        let refreshed = catalog.refresh(Some("amtrak".into())).await.unwrap_err();
+        assert!(!refreshed.error.contains(secret), "{}", refreshed.error);
+        assert!(catalog.list().to_string().contains("\"ready\":false"));
+
+        let dir = temp_dir("clear-failure");
+        let paths = fixtures::materialize(&dir).unwrap();
+        catalog
+            .register(RegisterRequest {
+                feed_id: Some("amtrak".into()),
+                feed_set: Some(paths.feed_set.display().to_string()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let health = catalog.health(Some("amtrak".into())).await.unwrap();
+        assert_eq!(health["ready"], true);
+        assert!(health.get("error").is_none(), "{health}");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -1,6 +1,7 @@
 //! GTFS static and GTFS-Realtime explorer for MCP clients.
 
 mod catalog;
+mod config;
 mod error;
 pub mod fixtures;
 mod gtfs;
@@ -14,6 +15,7 @@ pub mod gtfs_rt {
 }
 
 pub use catalog::{Catalog, RegisterRequest};
+pub use config::{startup_plan, StartupFailure, StartupOverrides};
 pub use error::AppError;
-pub use query::{AlertQuery, TripUpdateQuery, VehicleQuery};
 pub use mcp::{serve_http, serve_stdio, spawn_http, GtfsServer};
+pub use query::{AlertQuery, TripUpdateQuery, VehicleQuery};

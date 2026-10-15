@@ -58,32 +58,82 @@ cargo build --release --locked
 
 ## Run
 
-Logs go to stderr. stdio mode must not print on stdout.
+Logs go to stderr. stdio mode must not print on stdout. The usual way to configure feeds is the `env` block of an MCP client (see below). The same variables work in a shell. A bad value is reported on stderr and in `list_feeds` / `feed_health`; the process still starts so the client can read the error. `register_feed` still works after startup.
 
 ```bash
-# Speak MCP on stdin/stdout. Preload a feed-set. Header values are never logged.
-gtfs-rt-mcp \
-  --feed-set https://127.0.0.1:8080/v1/feed-set.json \
-  --http-headers '{"Authorization":"Bearer ${TOKEN}"}' \
-  stdio
+# MBTA, public feeds, no API key. Already registered when the first tool runs.
+GTFS_RT_MCP_FEED_ID=mbta \
+GTFS_RT_MCP_STATIC=https://cdn.mbta.com/MBTA_GTFS.zip \
+GTFS_RT_MCP_TRIP_UPDATES=https://cdn.mbta.com/realtime/TripUpdates.pb \
+GTFS_RT_MCP_VEHICLE_POSITIONS=https://cdn.mbta.com/realtime/VehiclePositions.pb \
+GTFS_RT_MCP_ALERTS=https://cdn.mbta.com/realtime/Alerts.pb \
+gtfs-rt-mcp stdio
 
-# Or preload a public static zip and realtime protobufs.
-gtfs-rt-mcp \
-  --static https://cdn.mbta.com/MBTA_GTFS.zip \
-  --trip-updates https://cdn.mbta.com/realtime/TripUpdates.pb \
-  --vehicle-positions https://cdn.mbta.com/realtime/VehiclePositions.pb \
-  --alerts https://cdn.mbta.com/realtime/Alerts.pb \
-  stdio
+# Amtrak-style feed-set. The header value is a placeholder, not a real token.
+GTFS_RT_MCP_FEED_ID=amtrak \
+GTFS_RT_MCP_FEED_SET=http://127.0.0.1:8080/v1/feed-set.json \
+GTFS_RT_MCP_HTTP_HEADERS='{"Authorization":"Bearer replace-me"}' \
+gtfs-rt-mcp stdio
+
+# The same fields as flags. A flag overrides only that field of the unindexed feed.
+gtfs-rt-mcp --feed-id mbta --static https://cdn.mbta.com/MBTA_GTFS.zip stdio
 
 # Streamable HTTP on 127.0.0.1:8091, MCP at /mcp, liveness at /healthz.
 gtfs-rt-mcp http
 ```
 
-Environment variables mirror the flags: `GTFS_RT_MCP_FEED_SET`, `GTFS_RT_MCP_FEED_ID`, `GTFS_RT_MCP_STATIC`, `GTFS_RT_MCP_TRIP_UPDATES`, `GTFS_RT_MCP_VEHICLE_POSITIONS`, `GTFS_RT_MCP_ALERTS`, `GTFS_RT_MCP_RT_TTL`, `GTFS_RT_MCP_HTTP_HEADERS` (a JSON object), `GTFS_RT_MCP_BIND`, `GTFS_RT_MCP_ALLOWED_HOST`, and `GTFS_RT_MCP_LOG` or `RUST_LOG`.
+There are no built-in credentials. Header values are sent on fetch and are never written to logs or tool results. `feed_health` and `list_feeds` return header names only.
 
-There are no built-in credentials. If an agency requires a header, pass it at runtime. `feed_health` returns header names only.
+HTTP accepts `Host: localhost`, `127.0.0.1`, and `::1` by default. Add `--allowed-host your-pi.local` when a non-loopback client connects. `GTFS_RT_MCP_BIND` sets the listen address (default `127.0.0.1:8091`). `GTFS_RT_MCP_ALLOWED_HOST` may be repeated. `GTFS_RT_MCP_LOG` or `RUST_LOG` sets the stderr tracing filter.
 
-HTTP accepts `Host: localhost`, `127.0.0.1`, and `::1` by default. Add `--allowed-host your-pi.local` when a non-loopback client connects.
+## Environment variables
+
+Empty values are ignored. `http://` and `https://` are URLs; anything else is a filesystem path. A feed needs `FEED_SET` or `STATIC` (plus optional realtime URLs), not both.
+
+### One feed
+
+| Variable | Meaning |
+| --- | --- |
+| `GTFS_RT_MCP_FEED_SET` | `feed-set.json` URL or path. Artifact URLs come only from that document. |
+| `GTFS_RT_MCP_FEED_ID` | Feed id. Default `default`. Letters, numbers, and `_` `.` `:` `-`, 1–64 characters. |
+| `GTFS_RT_MCP_STATIC` | GTFS static zip URL or path. |
+| `GTFS_RT_MCP_TRIP_UPDATES` | TripUpdates protobuf URL or path. |
+| `GTFS_RT_MCP_VEHICLE_POSITIONS` | VehiclePositions protobuf URL or path. |
+| `GTFS_RT_MCP_ALERTS` | Alerts protobuf URL or path. |
+| `GTFS_RT_MCP_RT_TTL` | Realtime TTL in seconds. Integer 1–3600. Default 15. |
+| `GTFS_RT_MCP_STATIC_TTL` | Direct static-zip TTL in seconds. `0` disables the timer. Max 604800. Default 21600. |
+| `GTFS_RT_MCP_HTTP_HEADERS` | JSON object of header name to string value, for example `{"x-api-key":"replace-me"}`. |
+
+`--feed-set`, `--feed-id`, `--static`, `--trip-updates`, `--vehicle-positions`, `--alerts`, `--rt-ttl`, `--static-ttl`, and `--http-headers` override the matching variable above. They do not override numbered feeds or `GTFS_RT_MCP_FEEDS`.
+
+### Several feeds
+
+Use numbered variables **or** `GTFS_RT_MCP_FEEDS`, not both. Setting both records a configuration error and registers neither set. The unindexed feed above can sit next to one of those styles. Indexes start at 1, have no gaps, and stop at 32. A missing id becomes `feed1`, `feed2`, and so on. Two feeds with the same id are both dropped.
+
+| Variable | Meaning |
+| --- | --- |
+| `GTFS_RT_MCP_FEED_<n>_ID` | Feed id. |
+| `GTFS_RT_MCP_FEED_<n>_NAME` | Alias of `_ID`. If both are set and differ, the error is reported and `_ID` is used. |
+| `GTFS_RT_MCP_FEED_<n>_FEED_SET` | Feed-set URL or path. |
+| `GTFS_RT_MCP_FEED_<n>_STATIC` | Static zip URL or path. |
+| `GTFS_RT_MCP_FEED_<n>_TRIP_UPDATES` | TripUpdates URL or path. |
+| `GTFS_RT_MCP_FEED_<n>_VEHICLE_POSITIONS` | VehiclePositions URL or path. |
+| `GTFS_RT_MCP_FEED_<n>_ALERTS` | Alerts URL or path. |
+| `GTFS_RT_MCP_FEED_<n>_RT_TTL` | Realtime TTL. Same limits as `GTFS_RT_MCP_RT_TTL`. |
+| `GTFS_RT_MCP_FEED_<n>_STATIC_TTL` | Static TTL. Same limits as `GTFS_RT_MCP_STATIC_TTL`. |
+| `GTFS_RT_MCP_FEED_<n>_HTTP_HEADERS` | JSON object of header strings. |
+| `GTFS_RT_MCP_FEEDS` | JSON array of feed objects. See the field names below. |
+
+`GTFS_RT_MCP_FEEDS` objects accept `id` / `name` / `feed_id`, `feed_set` / `feedSet`, `static` / `static_url` / `static_path`, `trip_updates` / `tripUpdates`, `vehicle_positions` / `vehiclePositions`, `alerts`, `rt_ttl_secs` / `rt_ttl`, `static_ttl_secs` / `static_ttl`, and `headers` / `http_headers`. A missing id becomes `feed1`, `feed2`, and so on.
+
+```bash
+GTFS_RT_MCP_FEEDS='[
+  {"id":"mbta","static":"https://cdn.mbta.com/MBTA_GTFS.zip","trip_updates":"https://cdn.mbta.com/realtime/TripUpdates.pb","vehicle_positions":"https://cdn.mbta.com/realtime/VehiclePositions.pb","alerts":"https://cdn.mbta.com/realtime/Alerts.pb"},
+  {"id":"amtrak","feed_set":"http://127.0.0.1:8080/v1/feed-set.json","headers":{"Authorization":"Bearer replace-me"}}
+]' gtfs-rt-mcp stdio
+```
+
+Invalid JSON, a skipped index, a bad TTL, an unknown suffix, or a feed that fails to download is listed in `config_errors` or as a feed row with `"ready": false`. Header values are replaced with `[redacted]` if they would otherwise appear in an error. `refresh_feed` retries a row that failed at startup. A later `register_feed` with the same id replaces it.
 
 ## Docker
 
@@ -100,20 +150,86 @@ The release binary built on this x86_64 machine is **9,843,096 bytes (9.4 MB)**,
 
 ## MCP clients
 
-Cursor `.cursor/mcp.json`, stdio:
+Put the binary on `PATH`, or use an absolute `command`. `args` must include `stdio`. Feeds in `env` are registered before the first tool call, so the model does not need `register_feed` for those feeds. `replace-me` below is a placeholder: substitute the publisher's token and do not commit a real one. The server never echoes that value.
+
+Cursor `.cursor/mcp.json` (MBTA, no API key):
 
 ```json
 {
   "mcpServers": {
     "gtfs-rt": {
       "command": "gtfs-rt-mcp",
-      "args": ["--feed-set", "http://127.0.0.1:8080/v1/feed-set.json", "stdio"]
+      "args": ["stdio"],
+      "env": {
+        "GTFS_RT_MCP_FEED_ID": "mbta",
+        "GTFS_RT_MCP_STATIC": "https://cdn.mbta.com/MBTA_GTFS.zip",
+        "GTFS_RT_MCP_TRIP_UPDATES": "https://cdn.mbta.com/realtime/TripUpdates.pb",
+        "GTFS_RT_MCP_VEHICLE_POSITIONS": "https://cdn.mbta.com/realtime/VehiclePositions.pb",
+        "GTFS_RT_MCP_ALERTS": "https://cdn.mbta.com/realtime/Alerts.pb"
+      }
     }
   }
 }
 ```
 
-Cursor, streamable HTTP (start `gtfs-rt-mcp http` first):
+Claude Desktop `claude_desktop_config.json` (Amtrak feed-set on localhost):
+
+```json
+{
+  "mcpServers": {
+    "gtfs-rt": {
+      "command": "gtfs-rt-mcp",
+      "args": ["stdio"],
+      "env": {
+        "GTFS_RT_MCP_FEED_ID": "amtrak",
+        "GTFS_RT_MCP_FEED_SET": "http://127.0.0.1:8080/v1/feed-set.json",
+        "GTFS_RT_MCP_HTTP_HEADERS": "{\"Authorization\":\"Bearer replace-me\"}"
+      }
+    }
+  }
+}
+```
+
+Claude Code `.mcp.json` (MBTA and the Amtrak feed-set together):
+
+```json
+{
+  "mcpServers": {
+    "gtfs-rt": {
+      "command": "gtfs-rt-mcp",
+      "args": ["stdio"],
+      "env": {
+        "GTFS_RT_MCP_FEEDS": "[{\"id\":\"mbta\",\"static\":\"https://cdn.mbta.com/MBTA_GTFS.zip\",\"trip_updates\":\"https://cdn.mbta.com/realtime/TripUpdates.pb\",\"vehicle_positions\":\"https://cdn.mbta.com/realtime/VehiclePositions.pb\",\"alerts\":\"https://cdn.mbta.com/realtime/Alerts.pb\"},{\"id\":\"amtrak\",\"feed_set\":\"http://127.0.0.1:8080/v1/feed-set.json\",\"headers\":{\"Authorization\":\"Bearer replace-me\"}}]"
+      }
+    }
+  }
+}
+```
+
+The same `mcpServers` objects work in any of the three files. Numbered variables are the other multi-feed form, for a client that prefers one variable per field:
+
+```json
+{
+  "mcpServers": {
+    "gtfs-rt": {
+      "command": "gtfs-rt-mcp",
+      "args": ["stdio"],
+      "env": {
+        "GTFS_RT_MCP_FEED_1_ID": "mbta",
+        "GTFS_RT_MCP_FEED_1_STATIC": "https://cdn.mbta.com/MBTA_GTFS.zip",
+        "GTFS_RT_MCP_FEED_1_TRIP_UPDATES": "https://cdn.mbta.com/realtime/TripUpdates.pb",
+        "GTFS_RT_MCP_FEED_1_VEHICLE_POSITIONS": "https://cdn.mbta.com/realtime/VehiclePositions.pb",
+        "GTFS_RT_MCP_FEED_1_ALERTS": "https://cdn.mbta.com/realtime/Alerts.pb",
+        "GTFS_RT_MCP_FEED_2_ID": "amtrak",
+        "GTFS_RT_MCP_FEED_2_FEED_SET": "http://127.0.0.1:8080/v1/feed-set.json",
+        "GTFS_RT_MCP_FEED_2_HTTP_HEADERS": "{\"Authorization\":\"Bearer replace-me\"}"
+      }
+    }
+  }
+}
+```
+
+Cursor streamable HTTP (start `gtfs-rt-mcp http` first; it reads the same environment):
 
 ```json
 {
@@ -125,19 +241,17 @@ Cursor, streamable HTTP (start `gtfs-rt-mcp http` first):
 }
 ```
 
-Claude Desktop `claude_desktop_config.json` uses the same `mcpServers` shape. Put a token in the environment of the client config (`env`), not in the binary.
-
-The server name is `gtfs-rt-mcp`. Instructions on `initialize` tell the model to register a feed, then use the tools below. Responses are compact JSON. Page with `offset` until `next_offset` is null.
+The server name is `gtfs-rt-mcp`. Instructions on `initialize` tell the model to call `list_feeds` first. Responses are compact JSON. Page with `offset` until `next_offset` is null.
 
 ## Tools
 
 | Tool | What it answers |
 | --- | --- |
-| `register_feed` | Load a feed-set URL or a static zip plus realtime URLs. Replaces the same `feed_id`. |
-| `list_feeds` | Registered feeds and freshness. |
+| `register_feed` | Load a feed-set URL or a static zip plus realtime URLs. Replaces the same `feed_id`, including a startup row that failed. |
+| `list_feeds` | Registered feeds, `ready`, and `config_errors` from startup. Header names only. |
 | `unregister_feed` | Drop a feed and its caches. |
-| `refresh_feed` | Re-read now. Feed-set static files reload only when the generation changes. |
-| `feed_health` | Counts, header timestamps, age, TTL, last error, generation. |
+| `refresh_feed` | Re-read now. Retries a feed that failed at startup. Feed-set static files reload only when the generation changes. |
+| `feed_health` | Counts, header timestamps, age, TTL, last error, generation, and `config_errors`. |
 | `search_stops` | `stop_id`, code, or name. Default 20, max 100. |
 | `search_routes` | `route_id`, short name, or long name. |
 | `trip_status` | Where a trip is. `trip` is a `trip_id` or `trip_short_name` (train number). Optional `stop` fills delay and track. |
@@ -257,6 +371,7 @@ GitHub Actions (`.github/workflows/ci.yml`) installs `protoc`, runs `cargo test 
 ## Layout
 
 - `src/mcp.rs` — tool schemas and stdio / streamable HTTP serving
+- `src/config.rs` — startup feed registration from environment variables and flags
 - `src/catalog.rs` — feed registry, TTL refresh, last-good cache
 - `src/gtfs.rs` — static zip to in-memory SQLite
 - `src/realtime.rs` — protobuf decode, delay labels, platform fields

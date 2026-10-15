@@ -3,7 +3,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use gtfs_rt_mcp::{serve_http, serve_stdio, Catalog, GtfsServer, RegisterRequest};
+use gtfs_rt_mcp::{
+    serve_http, serve_stdio, startup_plan, Catalog, GtfsServer, StartupFailure, StartupOverrides,
+};
+use serde_json::Value;
 
 #[derive(Parser)]
 #[command(
@@ -12,29 +15,32 @@ use gtfs_rt_mcp::{serve_http, serve_stdio, Catalog, GtfsServer, RegisterRequest}
     about = "MCP server for GTFS static schedules and GTFS-Realtime"
 )]
 struct Cli {
-    /// Feed-set JSON URL or path. Artifact URLs are taken from the document.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_FEED_SET")]
+    /// Feed-set JSON URL or path for the unindexed default feed. Overrides GTFS_RT_MCP_FEED_SET.
+    #[arg(long, global = true)]
     feed_set: Option<String>,
-    /// Id for the preloaded feed. Default "default".
-    #[arg(long, global = true, env = "GTFS_RT_MCP_FEED_ID")]
+    /// Id for the unindexed default feed. Overrides GTFS_RT_MCP_FEED_ID.
+    #[arg(long, global = true)]
     feed_id: Option<String>,
-    /// GTFS static zip URL or filesystem path.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_STATIC")]
+    /// GTFS static zip URL or filesystem path. Overrides GTFS_RT_MCP_STATIC.
+    #[arg(long, global = true)]
     r#static: Option<String>,
-    /// TripUpdates protobuf URL or path.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_TRIP_UPDATES")]
+    /// TripUpdates protobuf URL or path. Overrides GTFS_RT_MCP_TRIP_UPDATES.
+    #[arg(long, global = true)]
     trip_updates: Option<String>,
-    /// VehiclePositions protobuf URL or path.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_VEHICLE_POSITIONS")]
+    /// VehiclePositions protobuf URL or path. Overrides GTFS_RT_MCP_VEHICLE_POSITIONS.
+    #[arg(long, global = true)]
     vehicle_positions: Option<String>,
-    /// Alerts protobuf URL or path.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_ALERTS")]
+    /// Alerts protobuf URL or path. Overrides GTFS_RT_MCP_ALERTS.
+    #[arg(long, global = true)]
     alerts: Option<String>,
-    /// Realtime TTL in seconds. Default 15.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_RT_TTL")]
+    /// Realtime TTL in seconds for the default feed. Overrides GTFS_RT_MCP_RT_TTL.
+    #[arg(long, global = true)]
     rt_ttl: Option<u64>,
-    /// JSON object of HTTP headers. Values are never logged.
-    #[arg(long, global = true, env = "GTFS_RT_MCP_HTTP_HEADERS")]
+    /// Static TTL in seconds for the default feed. 0 disables the timer. Overrides GTFS_RT_MCP_STATIC_TTL.
+    #[arg(long, global = true)]
+    static_ttl: Option<u64>,
+    /// JSON object of HTTP headers for the default feed. Overrides GTFS_RT_MCP_HTTP_HEADERS. Values are never logged.
+    #[arg(long, global = true)]
     http_headers: Option<String>,
     #[command(subcommand)]
     command: Command,
@@ -66,10 +72,7 @@ async fn main() {
             std::process::exit(1);
         }
     };
-    if let Err(error) = preload(&catalog, &cli).await {
-        eprintln!("gtfs-rt-mcp: {error}");
-        std::process::exit(1);
-    }
+    preload(&catalog, &cli).await;
     let result = match cli.command {
         Command::Stdio => serve_stdio(GtfsServer::new(catalog)).await,
         Command::Http {
@@ -95,64 +98,94 @@ fn init_tracing(http: bool) {
         .try_init();
 }
 
-async fn preload(catalog: &Catalog, cli: &Cli) -> Result<(), gtfs_rt_mcp::AppError> {
-    let headers = parse_headers(cli.http_headers.as_deref())?;
-    let header_count = headers.len();
-    let has_source = cli.feed_set.is_some()
-        || cli.r#static.is_some()
-        || cli.trip_updates.is_some()
-        || cli.vehicle_positions.is_some()
-        || cli.alerts.is_some();
-    if !has_source {
-        if header_count > 0 {
-            tracing::warn!("GTFS_RT_MCP_HTTP_HEADERS is set but no feed was preloaded");
-        }
-        return Ok(());
-    }
-    let (static_url, static_path) = split_loc(cli.r#static.clone());
-    let (trip_updates_url, trip_updates_path) = split_loc(cli.trip_updates.clone());
-    let (vehicle_positions_url, vehicle_positions_path) = split_loc(cli.vehicle_positions.clone());
-    let (alerts_url, alerts_path) = split_loc(cli.alerts.clone());
-    tracing::info!(
-        feed_id = cli.feed_id.as_deref().unwrap_or("default"),
-        header_count,
-        "preloading feed"
-    );
-    catalog
-        .register(RegisterRequest {
+async fn preload(catalog: &Catalog, cli: &Cli) {
+    let plan = startup_plan(
+        std::env::vars(),
+        &StartupOverrides {
             feed_id: cli.feed_id.clone(),
             feed_set: cli.feed_set.clone(),
-            static_url,
-            static_path,
-            trip_updates_url,
-            trip_updates_path,
-            vehicle_positions_url,
-            vehicle_positions_path,
-            alerts_url,
-            alerts_path,
+            static_gtfs: cli.r#static.clone(),
+            trip_updates: cli.trip_updates.clone(),
+            vehicle_positions: cli.vehicle_positions.clone(),
+            alerts: cli.alerts.clone(),
             rt_ttl_secs: cli.rt_ttl,
-            static_ttl_secs: None,
-            headers,
-        })
-        .await?;
-    Ok(())
-}
-
-fn parse_headers(raw: Option<&str>) -> Result<BTreeMap<String, String>, gtfs_rt_mcp::AppError> {
-    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
-        return Ok(BTreeMap::new());
-    };
-    serde_json::from_str(raw).map_err(|e| {
-        gtfs_rt_mcp::AppError::new(format!("GTFS_RT_MCP_HTTP_HEADERS is not a JSON object: {e}"))
-    })
-}
-
-fn split_loc(value: Option<String>) -> (Option<String>, Option<String>) {
-    match value {
-        Some(value) if value.starts_with("http://") || value.starts_with("https://") => {
-            (Some(value), None)
-        }
-        Some(value) => (None, Some(value)),
-        None => (None, None),
+            static_ttl_secs: cli.static_ttl,
+            http_headers: cli.http_headers.clone(),
+        },
+    );
+    catalog.add_config_errors(plan.errors.clone());
+    for error in &plan.errors {
+        eprintln!("gtfs-rt-mcp: {}", format_config_error(error));
     }
+    for failure in plan.failures {
+        report_failure(&failure);
+        let mut error = gtfs_rt_mcp::AppError::new(failure.redact_error());
+        if let Some(hint) = failure.hint.clone() {
+            error = error.hint(hint);
+        }
+        catalog.note_load_failure(failure.request, &error);
+    }
+    for request in plan.requests {
+        let id = request
+            .feed_id
+            .clone()
+            .unwrap_or_else(|| "default".to_string());
+        let header_count = request.headers.len();
+        tracing::info!(
+            feed_id = %id,
+            header_count,
+            "loading feed from startup configuration"
+        );
+        match catalog.register(request.clone()).await {
+            Ok(_) => {}
+            Err(error) => {
+                let redacted = redact(&error.error, &request.headers);
+                eprintln!("gtfs-rt-mcp: feed {id}: {redacted}");
+                let mut reported = gtfs_rt_mcp::AppError::new(redacted);
+                if let Some(hint) = error.hint {
+                    reported = reported.hint(hint);
+                }
+                catalog.note_load_failure(request, &reported);
+            }
+        }
+    }
+}
+
+fn report_failure(failure: &StartupFailure) {
+    let message = failure.redact_error();
+    match &failure.hint {
+        Some(hint) => eprintln!("gtfs-rt-mcp: {message} ({hint})"),
+        None => eprintln!("gtfs-rt-mcp: {message}"),
+    }
+}
+
+fn format_config_error(value: &Value) -> String {
+    let error = value
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or("invalid feed configuration");
+    let var = value.get("var").and_then(Value::as_str);
+    let feed = value.get("feed_id").and_then(Value::as_str);
+    let hint = value.get("hint").and_then(Value::as_str);
+    let mut text = match (var, feed) {
+        (Some(var), _) => format!("{var}: {error}"),
+        (None, Some(feed)) => format!("feed {feed}: {error}"),
+        (None, None) => error.to_string(),
+    };
+    if let Some(hint) = hint {
+        text.push_str(" (");
+        text.push_str(hint);
+        text.push(')');
+    }
+    text
+}
+
+fn redact(text: &str, headers: &BTreeMap<String, String>) -> String {
+    let mut text = text.to_string();
+    for value in headers.values() {
+        if value.len() >= 4 {
+            text = text.replace(value, "[redacted]");
+        }
+    }
+    text
 }
