@@ -1,0 +1,59 @@
+[package]
+name = "gtfs-rt-mcp"
+description = "MCP server for exploring GTFS static schedules and GTFS-Realtime feeds"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+readme = "README.md"
+
+[[bin]]
+name = "gtfs-rt-mcp"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+axum = { version = "0.8", default-features = false, features = ["http1", "tokio", "json"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+chrono-tz = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+csv = "1"
+flate2 = "1"
+prost = "0.14"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "stream", "gzip"] }
+rmcp = { version = "3.5", default-features = false, features = [
+    "server",
+    "macros",
+    "transport-io",
+    "transport-streamable-http-server",
+] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+schemars = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "fs", "io-util", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+rmcp = { version = "3.5", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process"] }
+
+[build-dependencies]
+prost-build = "0.14"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+opt-level = "z"
+panic = "abort"

@@ -1,0 +1,7 @@
+stop_id,stop_code,stop_name,stop_lat,stop_lon,location_type,parent_station,platform_code
+NHV,NHV,New Haven Union Station,41.2975,-72.9267,0,NHV:station,
+NHV:station,NHV,New Haven Union Station,41.2975,-72.9267,1,,
+NHV:track:12,NHV,New Haven Union Station Track 12,41.2975,-72.9267,0,NHV:station,12
+NYP,NYP,New York Penn Station,40.7506,-73.9935,0,,
+BOS,BOS,Boston South Station,42.3523,-71.0552,0,,
+WAS,WAS,Washington Union Station,38.8971,-77.0064,0,,

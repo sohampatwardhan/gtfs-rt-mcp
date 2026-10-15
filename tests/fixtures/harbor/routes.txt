@@ -1,0 +1,3 @@
+route_id,agency_id,route_short_name,route_long_name,route_type,route_color
+NEC,HARBOR,NEC,Northeast Corridor,2,003366
+LOCAL,HARBOR,LCL,Harbor Local,3,888888
