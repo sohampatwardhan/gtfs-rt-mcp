@@ -248,7 +248,8 @@ pub async fn fetch_bytes(
                     .chars()
                     .take(180)
                     .collect::<String>();
-                return Err(err(format!("GET {url} returned {status}: {snippet}")));
+                return Err(err(format!("GET {url} returned {status}: {snippet}"))
+                    .extra("status", Value::from(status.as_u16())));
             }
             read_capped(response, max_bytes, url).await
         }
@@ -277,6 +278,12 @@ async fn read_capped(
         out.extend_from_slice(&chunk);
     }
     Ok(out)
+}
+
+/// Whether a fetch failed with HTTP 404. For a feed-set artifact that means its generation was
+/// pruned, and the manifest names a newer one.
+pub fn is_not_found(error: &AppError) -> bool {
+    error.extra.get("status").and_then(Value::as_u64) == Some(404)
 }
 
 pub fn loc_label(loc: &Loc) -> String {

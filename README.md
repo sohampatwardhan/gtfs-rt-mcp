@@ -26,12 +26,14 @@ flowchart LR
   Catalog --> Static[("in-memory SQLite<br/>stops, routes, trips, stop_times")]
   Catalog --> Cache["decoded TripUpdates,<br/>VehiclePositions, Alerts"]
   Catalog -->|"re-read on the realtime TTL"| Manifest["feed-set.json"]
-  Manifest -->|"only when generation_id changes"| Generation["immutable generation<br/>static.zip and protobufs"]
+  Manifest -->|"protobufs when generation_id changes,<br/>static.zip when static_version changes"| Generation["immutable generation<br/>static.zip and protobufs"]
   Catalog -->|"direct mode, refetch on TTL"| Agency["agency static zip<br/>and realtime URLs"]
   Generation --> Agency
 ```
 
-Static GTFS is parsed once into SQLite. Feed-set generations are immutable: the server re-fetches `feed-set.json` when the realtime TTL expires and downloads `static.zip` and the protobufs only when `generation_id` or `static_version` changes. Direct agency URLs are mutable, so those bytes are fetched again on the TTL. A failed refresh keeps the last good copy and records `last_error` on `feed_health`.
+Static GTFS is parsed once into SQLite. Feed-set generations are immutable: the server re-fetches `feed-set.json` when the realtime TTL expires, downloads the three protobufs only when `generation_id` changes, and downloads and re-parses `static.zip` only when `static_version` changes. Amtrak-GTFS-RT publishes a generation about every 45 seconds but keeps the same static bytes under each generation's URL until its static version changes, so the static zip is keyed by `static_version` rather than by its generation-scoped URL. A feed-set without `static_version` falls back to the URL. Direct agency URLs are mutable, so those bytes are fetched again on the TTL. A failed refresh keeps the last good copy and records `last_error` on `feed_health`.
+
+Amtrak-GTFS-RT also deletes superseded generations (after `AMTRAK_GENERATION_RETAIN_SECS`, 600 by default, or beyond `AMTRAK_GENERATION_MAX`). If an artifact of the generation just read returns `404`, the server reads `feed-set.json` once more and loads the newer generation instead of recording an error.
 
 ## Build
 

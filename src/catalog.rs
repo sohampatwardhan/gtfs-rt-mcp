@@ -17,8 +17,8 @@ use crate::query::{
 };
 use crate::realtime::{self, incrementality};
 use crate::source::{
-    self, fetch_bytes, loc_label, manifest_json, parse_feed_set, validate_headers, FeedSpec, Loc,
-    Manifest, MAX_RT_BYTES, MAX_STATIC_BYTES,
+    self, fetch_bytes, is_not_found, loc_label, manifest_json, parse_feed_set, validate_headers,
+    FeedSpec, Loc, Manifest, MAX_RT_BYTES, MAX_STATIC_BYTES,
 };
 
 const MAX_FEEDS: usize = 16;
@@ -56,6 +56,9 @@ struct FeedData {
     static_key: String,
     static_fetched: Instant,
     static_fetched_unix: u64,
+    /// When the static copy was last confirmed current: a download, or a feed-set manifest whose
+    /// static version still matches. The static TTL runs from here.
+    static_checked: Instant,
     trip_updates: Option<CachedFeed>,
     vehicles: Option<CachedFeed>,
     alerts: Option<CachedFeed>,
@@ -598,7 +601,7 @@ impl Catalog {
                 .rt_fetched
                 .map(|t| t.elapsed())
                 .unwrap_or(Duration::MAX);
-            let static_age = data.static_fetched.elapsed();
+            let static_age = data.static_checked.elapsed();
             let need_rt = force || rt_age >= data.rt_ttl;
             let recheck_static = data.static_ttl > Duration::ZERO && static_age >= data.static_ttl;
             if !need_rt && !recheck_static {
@@ -655,7 +658,12 @@ enum FeedUpdate {
         vehicles: Option<CachedFeed>,
         alerts: Option<CachedFeed>,
     },
-    ManifestOnly(Manifest),
+    /// The feed-set still names the loaded generation. Its artifacts are immutable, so nothing is
+    /// downloaded; `rt_current` marks the realtime copy as checked.
+    ManifestOnly {
+        manifest: Manifest,
+        rt_current: bool,
+    },
 }
 
 fn apply_update(data: &mut FeedData, update: FeedUpdate) {
@@ -669,6 +677,7 @@ fn apply_update(data: &mut FeedData, update: FeedUpdate) {
         } => {
             if let Some(manifest) = manifest {
                 data.manifest = Some(manifest);
+                data.static_checked = Instant::now();
             }
             data.trip_updates = trip_updates;
             data.vehicles = vehicles;
@@ -677,28 +686,83 @@ fn apply_update(data: &mut FeedData, update: FeedUpdate) {
             data.rt_fetched_unix = now_unix() as u64;
             data.last_error = None;
         }
-        FeedUpdate::ManifestOnly(manifest) => {
+        FeedUpdate::ManifestOnly {
+            manifest,
+            rt_current,
+        } => {
             data.manifest = Some(manifest);
+            data.static_checked = Instant::now();
+            if rt_current {
+                data.rt_fetched = Some(Instant::now());
+                data.rt_fetched_unix = now_unix() as u64;
+            }
             data.last_error = None;
         }
     }
 }
 
-fn static_key_for(manifest: &Manifest) -> String {
-    format!(
-        "{}|{}",
-        loc_label(&manifest.static_zip),
-        manifest.static_version.clone().unwrap_or_default()
-    )
+/// What identifies a feed-set's static GTFS. Amtrak-GTFS-RT serves the same static.zip under every
+/// generation's URL until `static_version` changes, so the version is the key and the
+/// generation-scoped URL is not. Without a version, the URL is all there is.
+fn static_key_for(feed_set: &Loc, manifest: &Manifest) -> String {
+    match manifest.static_version.as_deref().map(str::trim) {
+        Some(version) if !version.is_empty() => {
+            format!("{}|static_version:{version}", loc_label(feed_set))
+        }
+        _ => loc_label(&manifest.static_zip),
+    }
 }
 
-fn same_generation(plan: &RefreshPlan, manifest: &Manifest) -> bool {
+fn same_generation(plan: &RefreshPlan, feed_set: &Loc, manifest: &Manifest) -> bool {
     match (&plan.generation, &manifest.generation_id) {
         (Some(previous), Some(next)) => {
-            previous == next && plan.static_key == static_key_for(manifest)
+            previous == next && plan.static_key == static_key_for(feed_set, manifest)
         }
         _ => false,
     }
+}
+
+async fn read_manifest(
+    http: &reqwest::Client,
+    url: &Loc,
+    headers: &BTreeMap<String, String>,
+) -> Result<Manifest, AppError> {
+    let bytes = fetch_bytes(http, url, headers, 2_000_000).await?;
+    parse_feed_set(&bytes, url)
+}
+
+/// Brings a loaded feed-set up to `manifest`, downloading only what changed.
+async fn feed_set_update(
+    http: &reqwest::Client,
+    plan: &RefreshPlan,
+    url: &Loc,
+    manifest: Manifest,
+) -> Result<FeedUpdate, AppError> {
+    if same_generation(plan, url, &manifest) {
+        return Ok(FeedUpdate::ManifestOnly {
+            manifest,
+            rt_current: plan.need_rt,
+        });
+    }
+    if !plan.static_key.is_empty() && plan.static_key == static_key_for(url, &manifest) {
+        let (trip_updates, vehicles, alerts) = download_triplet(
+            http,
+            &plan.headers,
+            manifest.trip_updates.as_ref(),
+            manifest.vehicle_positions.as_ref(),
+            manifest.alerts.as_ref(),
+        )
+        .await?;
+        return Ok(FeedUpdate::Realtime {
+            manifest: Some(manifest),
+            trip_updates,
+            vehicles,
+            alerts,
+        });
+    }
+    Ok(FeedUpdate::Full(
+        load_feed_set(http, plan, url, manifest).await?,
+    ))
 }
 
 async fn refresh_loaded(
@@ -707,30 +771,16 @@ async fn refresh_loaded(
 ) -> Result<FeedUpdate, AppError> {
     match &plan.spec {
         FeedSpec::FeedSet { url } => {
-            let bytes = fetch_bytes(http, url, &plan.headers, 2_000_000).await?;
-            let manifest = parse_feed_set(&bytes, url)?;
-            if same_generation(plan, &manifest) {
-                if !plan.need_rt {
-                    return Ok(FeedUpdate::ManifestOnly(manifest));
+            let manifest = read_manifest(http, url, &plan.headers).await?;
+            match feed_set_update(http, plan, url, manifest).await {
+                // A publisher that prunes superseded generations can delete this one between the
+                // manifest read and its artifacts. Re-read once and take the newer generation.
+                Err(error) if is_not_found(&error) => {
+                    let manifest = read_manifest(http, url, &plan.headers).await?;
+                    feed_set_update(http, plan, url, manifest).await
                 }
-                let (trip_updates, vehicles, alerts) = download_triplet(
-                    http,
-                    &plan.headers,
-                    manifest.trip_updates.as_ref(),
-                    manifest.vehicle_positions.as_ref(),
-                    manifest.alerts.as_ref(),
-                )
-                .await?;
-                return Ok(FeedUpdate::Realtime {
-                    manifest: Some(manifest),
-                    trip_updates,
-                    vehicles,
-                    alerts,
-                });
+                result => result,
             }
-            Ok(FeedUpdate::Full(
-                load_feed_set(http, plan, url, manifest).await?,
-            ))
         }
         FeedSpec::Direct {
             static_gtfs,
@@ -790,9 +840,14 @@ async fn load_feed(
     };
     match spec {
         FeedSpec::FeedSet { url } => {
-            let bytes = fetch_bytes(http, &url, &plan.headers, 2_000_000).await?;
-            let manifest = parse_feed_set(&bytes, &url)?;
-            load_feed_set(http, &plan, &url, manifest).await
+            let manifest = read_manifest(http, &url, &plan.headers).await?;
+            match load_feed_set(http, &plan, &url, manifest).await {
+                Err(error) if is_not_found(&error) => {
+                    let manifest = read_manifest(http, &url, &plan.headers).await?;
+                    load_feed_set(http, &plan, &url, manifest).await
+                }
+                result => result,
+            }
         }
         FeedSpec::Direct {
             static_gtfs,
@@ -819,7 +874,7 @@ async fn load_feed_set(
     url: &Loc,
     manifest: Manifest,
 ) -> Result<FeedData, AppError> {
-    let static_key = static_key_for(&manifest);
+    let static_key = static_key_for(url, &manifest);
     let zip = fetch_bytes(http, &manifest.static_zip, &plan.headers, MAX_STATIC_BYTES).await?;
     let db = tokio::task::spawn_blocking(move || StaticDb::load_zip(&zip))
         .await
@@ -842,6 +897,7 @@ async fn load_feed_set(
         static_key,
         static_fetched: Instant::now(),
         static_fetched_unix: now_unix() as u64,
+        static_checked: Instant::now(),
         trip_updates,
         vehicles,
         alerts,
@@ -877,6 +933,7 @@ async fn load_direct(
         static_key,
         static_fetched: Instant::now(),
         static_fetched_unix: now_unix() as u64,
+        static_checked: Instant::now(),
         trip_updates,
         vehicles,
         alerts,
@@ -1419,32 +1476,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// A feed-set server shaped like Amtrak-GTFS-RT: every generation has its own URLs, the static
+    /// zip is the same bytes until `static_version` changes, and pruned generations answer 404.
+    #[derive(Default)]
+    struct Publisher {
+        generation: String,
+        static_version: String,
+        /// Generations the next manifest reads name before `generation`, oldest first.
+        queued: std::collections::VecDeque<String>,
+        pruned: std::collections::HashSet<String>,
+        static_hits: usize,
+        trip_update_hits: usize,
+    }
+
     #[tokio::test]
-    async fn unchanged_generation_does_not_redownload_static() {
+    async fn feed_set_downloads_static_once_per_static_version() {
         let dir = temp_dir("gen-skip");
         let paths = fixtures::materialize(&dir).unwrap();
         let root = Arc::new(dir.clone());
-        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let generation = Arc::new(std::sync::Mutex::new("gen-1".to_string()));
         let at = paths.at_unix;
+        let publisher = Arc::new(std::sync::Mutex::new(Publisher {
+            generation: "gen-1".into(),
+            static_version: "harbor-1".into(),
+            ..Default::default()
+        }));
         let app = axum::Router::new()
             .route(
                 "/v1/feed-set.json",
                 axum::routing::get({
-                    let generation = Arc::clone(&generation);
+                    let publisher = Arc::clone(&publisher);
                     move || {
-                        let generation = Arc::clone(&generation);
+                        let publisher = Arc::clone(&publisher);
                         async move {
-                            let id = generation.lock().unwrap().clone();
+                            let mut state = publisher.lock().unwrap();
+                            let id = state.queued.pop_front().unwrap_or_else(|| state.generation.clone());
                             axum::Json(json!({
                                 "generation_id": id,
                                 "generated_at_unix": at,
-                                "static_version": "harbor-1",
+                                "static_version": state.static_version,
                                 "urls": {
-                                    "static_zip": "/v1/generations/gen/static.zip",
-                                    "trip_updates": "/v1/generations/gen/trip-updates.pb",
-                                    "vehicle_positions": "/v1/generations/gen/vehicle-positions.pb",
-                                    "alerts": "/v1/generations/gen/alerts.pb"
+                                    "static_zip": format!("/v1/generations/{id}/static.zip"),
+                                    "trip_updates": format!("/v1/generations/{id}/trip-updates.pb"),
+                                    "vehicle_positions": format!("/v1/generations/{id}/vehicle-positions.pb"),
+                                    "alerts": format!("/v1/generations/{id}/alerts.pb")
                                 }
                             }))
                         }
@@ -1455,13 +1529,21 @@ mod tests {
                 "/v1/generations/{id}/{name}",
                 axum::routing::get({
                     let root = Arc::clone(&root);
-                    let hits = Arc::clone(&hits);
-                    move |axum::extract::Path((_, name)): axum::extract::Path<(String, String)>| {
+                    let publisher = Arc::clone(&publisher);
+                    move |axum::extract::Path((id, name)): axum::extract::Path<(String, String)>| {
                         let root = Arc::clone(&root);
-                        let hits = Arc::clone(&hits);
+                        let publisher = Arc::clone(&publisher);
                         async move {
-                            if name == "static.zip" {
-                                hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            {
+                                let mut state = publisher.lock().unwrap();
+                                if state.pruned.contains(&id) {
+                                    return (axum::http::StatusCode::NOT_FOUND, Vec::new());
+                                }
+                                match name.as_str() {
+                                    "static.zip" => state.static_hits += 1,
+                                    "trip-updates.pb" => state.trip_update_hits += 1,
+                                    _ => {}
+                                }
                             }
                             match tokio::fs::read(root.join(&name)).await {
                                 Ok(bytes) => (axum::http::StatusCode::OK, bytes),
@@ -1476,25 +1558,57 @@ mod tests {
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
+        let hits = || {
+            let state = publisher.lock().unwrap();
+            (state.static_hits, state.trip_update_hits)
+        };
         let catalog = Catalog::new().unwrap();
         catalog
             .register(RegisterRequest {
                 feed_set: Some(format!("http://{addr}/v1/feed-set.json")),
-                rt_ttl_secs: Some(1),
                 ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(hits(), (1, 1));
+
+        // Same generation: its artifacts are immutable, so nothing is downloaded again.
+        catalog.refresh(None).await.unwrap();
         let health = catalog.health(None).await.unwrap();
         assert_eq!(health["feed_set"]["generation_id"], "gen-1");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
-        *generation.lock().unwrap() = "gen-2".into();
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert_eq!(hits(), (1, 1));
+
+        // New generation, same static_version: only the protobufs are fetched.
+        publisher.lock().unwrap().generation = "gen-2".into();
+        catalog.refresh(None).await.unwrap();
         let health = catalog.health(None).await.unwrap();
         assert_eq!(health["feed_set"]["generation_id"], "gen-2");
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(health["realtime"]["last_error"], Value::Null);
+        assert_eq!(hits(), (1, 2));
+
+        // The manifest names gen-3, but it is pruned before its artifacts are read; gen-4 is current.
+        {
+            let mut state = publisher.lock().unwrap();
+            state.queued.push_back("gen-3".into());
+            state.pruned.insert("gen-3".into());
+            state.generation = "gen-4".into();
+        }
+        catalog.refresh(None).await.unwrap();
+        let health = catalog.health(None).await.unwrap();
+        assert_eq!(health["feed_set"]["generation_id"], "gen-4");
+        assert_eq!(health["realtime"]["last_error"], Value::Null);
+        assert_eq!(hits(), (1, 3));
+
+        // A new static_version loads the static zip again.
+        {
+            let mut state = publisher.lock().unwrap();
+            state.generation = "gen-5".into();
+            state.static_version = "harbor-2".into();
+        }
+        catalog.refresh(None).await.unwrap();
+        let health = catalog.health(None).await.unwrap();
+        assert_eq!(health["feed_set"]["static_version"], "harbor-2");
+        assert_eq!(hits(), (2, 4));
         let _ = std::fs::remove_dir_all(dir);
     }
 
